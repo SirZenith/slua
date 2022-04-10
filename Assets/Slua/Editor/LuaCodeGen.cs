@@ -65,22 +65,15 @@ namespace SLua
             {
                 EditorApplication.update += Update;
                 // use this delegation to ensure dispose luavm at last
-                EditorApplication.playModeStateChanged += (PlayModeStateChange state) =>
+                EditorApplication.playmodeStateChanged += () =>
                 {
-                    switch (state)
+
+                    if (isPlaying == true && EditorApplication.isPlaying == false)
                     {
-                        case PlayModeStateChange.ExitingEditMode:
-                            if (isPlaying == true && EditorApplication.isPlaying == false)
-                            {
-                                if (LuaState.main != null)
-                                    LuaState.main.Dispose();
-                                isPlaying = false;
-                            }
-                            break;
-                        case PlayModeStateChange.EnteredPlayMode:
-                            isPlaying = true;
-                            break;
+                        if (LuaState.main != null) LuaState.main.Dispose();
                     }
+
+                    isPlaying = EditorApplication.isPlaying;
                 };
             }
 
@@ -751,6 +744,36 @@ namespace SLua
             "PlayableGraph.CreateScriptPlayable",
         };
 
+        static Dictionary<Type, string> luaTypeMap = new Dictionary<Type, string>()
+        {
+            {typeof(bool), "boolean"},
+            {typeof(byte), "number"},
+            {typeof(sbyte), "number"},
+            {typeof(float), "number"},
+            {typeof(double), "number"},
+            {typeof(decimal), "number"},
+            {typeof(int), "integer"},
+            {typeof(uint), "integer"},
+            {typeof(long), "integer"},
+            {typeof(ulong), "integer"},
+            {typeof(short), "integer"},
+            {typeof(ushort), "integer"},
+            {typeof(char), "string"},
+            {typeof(string), "string"},
+            {typeof(object), "any"},
+            {typeof(void), "nil"}
+        };
+
+        static string GetLuaTypeFor(Type type)
+        {
+            string typeAnnotation;
+            if (type.BaseType == typeof(MulticastDelegate))
+                typeAnnotation = "function";
+            else if (!luaTypeMap.TryGetValue(type, out typeAnnotation))
+                typeAnnotation = type.Name;
+
+            return typeAnnotation;
+        }
 
         static void FilterSpecMethods(out Dictionary<Type, List<MethodInfo>> dic, out Dictionary<Type, Type> overloadedClass)
         {
@@ -827,11 +850,101 @@ namespace SLua
             FilterSpecMethods(out extensionMethods, out overloadedClass);
         }
 
+        class LuaNamespace
+        {
+
+            public EOL eol = SLuaSetting.Instance.eol;
+            string NewLine
+            {
+                get
+                {
+                    switch (eol)
+                    {
+                        case EOL.Native:
+                            return System.Environment.NewLine;
+                        case EOL.CRLF:
+                            return "\r\n";
+                        case EOL.CR:
+                            return "\r";
+                        case EOL.LF:
+                            return "\n";
+                        default:
+                            return "";
+                    }
+                }
+            }
+            string name;
+            string fullName;
+            // wheather a Namespace is also a class
+            bool isClass;
+            Dictionary<string, LuaNamespace> children = new Dictionary<string, LuaNamespace>();
+
+            public LuaNamespace(string name, string fullName, bool isClass = false)
+            {
+                this.name = name;
+                this.fullName = fullName;
+                this.isClass = isClass;
+            }
+
+            public void SetAsClass() { isClass = true; }
+            public void AddChild(string fullPath)
+            {
+                char[] seps = { '.', '+' };
+                string[] parts = fullPath.Split(seps, 2);
+                if (!children.ContainsKey(parts[0]))
+                {
+                    children.Add(
+                        parts[0],
+                        new LuaNamespace(
+                            parts[0],
+                            String.IsNullOrEmpty(fullName) ? parts[0] : $"{fullName}.{parts[0]}",
+                            parts.Length == 1
+                        )
+                    );
+                }
+                if (parts.Length == 1)
+                    children[parts[0]].SetAsClass();
+                else
+                    children[parts[0]].AddChild(parts[1]);
+            }
+
+            public void Write(StreamWriter w)
+            {
+                if (children.Count == 0) return;
+
+                if (!String.IsNullOrEmpty(name))
+                {
+                    w.Write("---@class {0}", name);
+                    if (!isClass) w.Write(" : Namespace");
+                    w.Write(NewLine);
+
+                    foreach (KeyValuePair<string, LuaNamespace> child in children)
+                    {
+                        w.Write("---@field {0} {0}", child.Key);
+                        w.Write(NewLine);
+                    }
+                    w.Write("---@type {0}", name);
+                    w.Write(NewLine);
+                    w.Write("{0} = {0}", fullName);
+                    w.Write(NewLine);
+                    w.Write(NewLine);
+                }
+                foreach (KeyValuePair<string, LuaNamespace> child in children)
+                {
+                    child.Value.Write(w);
+                }
+            }
+        }
         HashSet<string> funcname = new HashSet<string>();
         Dictionary<string, bool> directfunc = new Dictionary<string, bool>();
 
         public string givenNamespace;
-        public string path;
+        public string path; // path for generating C# files
+        // path for generating EmmyLua Annotation
+        public string emmyLuaPath
+        {
+            get => path + "EmmyLua/";
+        }
         public bool includeExtension = SLuaSetting.Instance.exportExtensionMethod;
         public EOL eol = SLuaSetting.Instance.eol;
 
@@ -847,6 +960,7 @@ namespace SLua
 
         public void GenerateBind(List<Type> list, string name, int order)
         {
+            LuaNamespace rootNamespace = new LuaNamespace("", "", false);
             HashSet<Type> exported = new HashSet<Type>();
             string f = System.IO.Path.Combine(path, name + ".cs");
             StreamWriter file = new StreamWriter(f, false, Encoding.UTF8);
@@ -861,6 +975,7 @@ namespace SLua
             foreach (Type t in list)
             {
                 WriteBindType(file, t, list, exported);
+                rootNamespace.AddChild(t.FullName);
             }
             Write(file, "};");
             Write(file, "return list;");
@@ -868,6 +983,17 @@ namespace SLua
             Write(file, "}");
             Write(file, "}");
             file.Close();
+
+            string ef = Path.Combine(emmyLuaPath, name + ".lua");
+            using (var emmyFile = new StreamWriter(ef, false, Encoding.UTF8))
+            {
+                emmyFile.Write("---@class Namespace");
+                emmyFile.Write(NewLine);
+                emmyFile.Write("---@field __namespace__ any");
+                emmyFile.Write(NewLine);
+                emmyFile.Write(NewLine);
+                rootNamespace.Write(emmyFile);
+            }
         }
 
         void WriteBindType(StreamWriter file, Type t, List<Type> exported, HashSet<Type> binded)
@@ -900,6 +1026,10 @@ namespace SLua
             if (!Directory.Exists(path))
             {
                 Directory.CreateDirectory(path);
+            }
+            if (!Directory.Exists(emmyLuaPath))
+            {
+                Directory.CreateDirectory(emmyLuaPath);
             }
 
             if (!t.IsGenericTypeDefinition && (!IsObsolete(t) && t != typeof(YieldInstruction) && t != typeof(Coroutine))
@@ -936,14 +1066,16 @@ namespace SLua
                     propname.Clear();
                     directfunc.Clear();
 
-                    StreamWriter file = Begin(t);
-                    WriteHead(t, file);
+                    StreamWriter file, emmyFile;
+                    Begin(t, out file, out emmyFile);
+                    WriteHead(t, file, emmyFile);
                     WriteConstructor(t, file);
-                    WriteFunction(t, file, false);
-                    WriteFunction(t, file, true);
-                    WriteField(t, file);
+                    WriteField(t, file, emmyFile);
+                    WriteFunction(t, file, emmyFile, false);
+                    WriteFunction(t, file, emmyFile, true);
                     RegFunction(t, file);
-                    End(file);
+                    RegEmmyType(t, emmyFile);
+                    End(file, emmyFile);
 
                     if (t.BaseType != null && t.BaseType.Name.Contains("UnityEvent`"))
                     {
@@ -1312,11 +1444,32 @@ namespace SLua
             return file;
         }
 
+        void Begin(Type t, out StreamWriter file, out StreamWriter emmyFile)
+        {
+            string clsname = ExportName(t);
+
+            string f = path + clsname + ".cs";
+            string ef = emmyLuaPath + clsname + ".lua";
+
+            file = new StreamWriter(f, false, Encoding.UTF8);
+            emmyFile = new StreamWriter(ef, false, Encoding.UTF8);
+
+            file.NewLine = NewLine;
+            emmyFile.NewLine = NewLine;
+        }
+
         private void End(StreamWriter file)
         {
             Write(file, "}");
             file.Flush();
             file.Close();
+        }
+
+        private void End(StreamWriter file, StreamWriter emmyFile)
+        {
+            End(file);
+            emmyFile.Flush();
+            emmyFile.Close();
         }
 
         private void WriteHead(Type t, StreamWriter file)
@@ -1333,6 +1486,12 @@ namespace SLua
             Write(file, "[UnityEngine.Scripting.Preserve]");
 #endif
             Write(file, "public class {0} : LuaObject {{", ExportName(t));
+        }
+
+        private void WriteHead(Type t, StreamWriter file, StreamWriter emmyFile)
+        {
+            WriteHead(t, file);
+            WriteEmmy(emmyFile, "---@class {0} {1}", t.Name, t.FullName);
         }
 
         // add namespace for extension method
@@ -1394,6 +1553,63 @@ namespace SLua
                     WriteFunctionDec(file, fn);
                     WriteFunctionImpl(file, mi, t, bf);
                     funcname.Add(fn);
+                }
+            }
+        }
+
+        private void WriteFunction(Type t, StreamWriter file, StreamWriter emmyFile, bool writeStatic = false)
+        {
+            WriteFunction(t, file, writeStatic);
+
+            BindingFlags bf = BindingFlags.Public | BindingFlags.DeclaredOnly;
+            if (writeStatic)
+                bf |= BindingFlags.Static;
+            else
+                bf |= BindingFlags.Instance;
+
+            MethodInfo[] members = t.GetMethods(bf);
+            List<MethodInfo> methods = new List<MethodInfo>();
+            foreach (MethodInfo mi in members)
+                methods.Add(tryFixGenericMethod(mi));
+
+            if (!writeStatic && this.includeExtension)
+            {
+                if (extensionMethods.ContainsKey(t))
+                {
+                    methods.AddRange(extensionMethods[t]);
+                }
+            }
+            foreach (MethodInfo mi in methods)
+            {
+                bool instanceFunc;
+                if (writeStatic && isPInvoke(mi, out instanceFunc)) continue;
+
+                string fn = writeStatic ? staticName(mi.Name) : mi.Name;
+                if (mi.MemberType == MemberTypes.Method
+                    && !IsObsolete(mi)
+                    && !DontExport(mi)
+                    && isUsefullMethod(mi)
+                    && !MemberInFilter(t, mi)
+                    && !ContainUnsafe(mi))
+                {
+                    string paraListStr = String.Join(
+                        ", ",
+                        mi.GetParameters().Select(
+                            para => String.Format(
+                                "{0}: {1}",
+                                para.Name,
+                                GetLuaTypeFor(para.ParameterType)
+                            )
+                        )
+                    );
+                    string typeAnnotation = mi.ReturnType == typeof(void)
+                        ? String.Format("fun({0})", paraListStr)
+                        : String.Format(
+                            "fun({0}): {1}",
+                            paraListStr,
+                            GetLuaTypeFor(mi.ReturnType)
+                        );
+                    WriteAEmmyField(emmyFile, fn, typeAnnotation);
                 }
             }
         }
@@ -1460,6 +1676,14 @@ namespace SLua
                 }
             }
             return false;
+        }
+
+        void RegEmmyType(Type t, StreamWriter emmyFile)
+        {
+            emmyFile.Write("---@type {0}", GetLuaTypeFor(t));
+            emmyFile.Write(NewLine);
+            string name = t.FullName.Replace('+', '.');
+            emmyFile.Write("{0} = {0}", name);
         }
 
         void RegFunction(Type t, StreamWriter file)
@@ -1569,7 +1793,18 @@ namespace SLua
             }
             return name;
         }
-
+        void WriteAEmmyField(StreamWriter emmyFile, string fiName, string type, string comment = "")
+        {
+            string template = String.IsNullOrEmpty(comment)
+                ? "---@field {0} {1}{2}"
+                : "---@field {0} {1} {2}";
+            WriteEmmy(emmyFile, template, fiName, type, comment);
+        }
+        void WriteAEmmyField(StreamWriter emmyFile, string fiName, Type fiType, string comment = "")
+        {
+            string typeAnnotation = GetLuaTypeFor(fiType);
+            WriteAEmmyField(emmyFile, fiName, typeAnnotation, comment);
+        }
         private void WriteField(Type t, StreamWriter file)
         {
             // Write field set/get
@@ -1731,6 +1966,40 @@ namespace SLua
             }
             //for this[]
             WriteItemFunc(t, file, getter, setter);
+        }
+        private void WriteField(Type t, StreamWriter file, StreamWriter emmyFile)
+        {
+            WriteField(t, file);
+            FieldInfo[] fields = t.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+            foreach (FieldInfo fi in fields)
+            {
+                if (DontExport(fi) || IsObsolete(fi))
+                    continue;
+                WriteAEmmyField(emmyFile, fi.Name, fi.FieldType);
+            }
+
+            PropertyInfo[] props = t.GetProperties(BindingFlags.Static | BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+            foreach (PropertyInfo fi in props)
+            {
+                //if (fi.Name == "Item" || IsObsolete(fi) || MemberInFilter(t,fi) || DontExport(fi))
+                if (IsObsolete(fi) || MemberInFilter(t, fi) || DontExport(fi))
+                    continue;
+                if (fi.Name == "Item"
+                    || (t.Name == "String" && fi.Name == "Chars")) // for string[]
+                {
+                    continue;
+                }
+
+                string nname = NormalName(fi.Name);
+                string comment;
+                if (!fi.CanRead || fi.GetGetMethod() == null)
+                    comment = "(s)";
+                else if (!fi.CanWrite || fi.GetSetMethod() == null)
+                    comment = "(g)";
+                else
+                    comment = "(g, s)";
+                WriteAEmmyField(emmyFile, nname, fi.PropertyType, comment);
+            }
         }
         void WriteItemFunc(Type t, StreamWriter file, List<PropertyInfo> getter, List<PropertyInfo> setter)
         {
@@ -1938,30 +2207,6 @@ namespace SLua
                 if (((List<string>)aFilterList).Contains(methodString))
                 {
                     return true;
-                }
-            }
-			
-			if (mi.DeclaringType.IsGenericType && mi.DeclaringType.GetGenericTypeDefinition() == typeof(Dictionary<,>))
-            {
-                if (mi.MemberType == MemberTypes.Constructor)
-                {
-                    ConstructorInfo constructorInfo = mi as ConstructorInfo;
-                    var parameterInfos = constructorInfo.GetParameters();
-                    if (parameterInfos.Length > 0)
-                    {
-                        if (typeof(System.Collections.IEnumerable).IsAssignableFrom(parameterInfos[0].ParameterType))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                else if (mi.MemberType == MemberTypes.Method)
-                {
-                    var methodInfo = mi as MethodInfo;
-                    if (methodInfo.Name == "TryAdd" || methodInfo.Name == "Remove" && methodInfo.GetParameters().Length == 2)
-                    {
-                        return true;
-                    }
                 }
             }
 
@@ -2222,7 +2467,6 @@ namespace SLua
         {
             WriteFunctionAttr(file);
             Write(file, "static public int {0}(IntPtr l) {{", name);
-
         }
 
         MethodBase[] GetMethods(Type t, string name, BindingFlags bf)
@@ -2573,136 +2817,150 @@ namespace SLua
             if (fmt.EndsWith("{")) indent++;
         }
 
+        void WriteEmmy(StreamWriter emmyFile, string fmt, params object[] args)
+        {
+            fmt = System.Text.RegularExpressions.Regex.Replace(fmt, @"\r\n?|\n|\r", NewLine);
+
+            if (args.Length == 0)
+                emmyFile.WriteLine(fmt);
+            else
+            {
+                string line = string.Format(fmt, args);
+                emmyFile.WriteLine(line);
+            }
+        }
+
         bool IsOutArg(ParameterInfo p)
         {
             return (p.IsOut || p.IsDefined(typeof(System.Runtime.InteropServices.OutAttribute), false)) && !p.ParameterType.IsArray;
         }
-		
-		private void CheckArgument(StreamWriter file, Type t, int n, int argstart, bool isout, bool isparams)
-		{
-			Write(file, "{0} a{1};", TypeDecl(t), n + 1);
-			
-			if (!isout)
-			{
-				if (t.IsEnum)
-					Write(file, "a{0} = ({1})LuaDLL.luaL_checkinteger(l, {2});", n + 1, TypeDecl(t), n + argstart);
-				else if (t.BaseType == typeof(System.MulticastDelegate))
-				{
-					tryMake(t);
-					Write(file, "checkDelegate(l,{0},out a{1});", n + argstart, n + 1);
-				}
-				else if (isparams)
-				{
-					if(t.GetElementType().IsValueType && !IsBaseType(t.GetElementType()))
-						Write(file, "checkValueParams(l,{0},out a{1});", n + argstart, n + 1);
-					else
-						Write(file, "checkParams(l,{0},out a{1});", n + argstart, n + 1);
-				}
-				else if(t.IsArray)
-					Write(file, "checkArray(l,{0},out a{1});", n + argstart, n + 1);
-				else if (IsValueType(t)) {
-					if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Nullable<>))
-						Write(file, "checkNullable(l,{0},out a{1});", n + argstart, n + 1);
-					else
-						Write(file, "checkValueType(l,{0},out a{1});", n + argstart, n + 1);
-				}
-				else
-					Write(file, "checkType(l,{0},out a{1});", n + argstart, n + 1);
-			}
-		}
 
-		bool IsValueType(Type t)
-		{
+        private void CheckArgument(StreamWriter file, Type t, int n, int argstart, bool isout, bool isparams)
+        {
+            Write(file, "{0} a{1};", TypeDecl(t), n + 1);
+
+            if (!isout)
+            {
+                if (t.IsEnum)
+                    Write(file, "a{0} = ({1})LuaDLL.luaL_checkinteger(l, {2});", n + 1, TypeDecl(t), n + argstart);
+                else if (t.BaseType == typeof(System.MulticastDelegate))
+                {
+                    tryMake(t);
+                    Write(file, "checkDelegate(l,{0},out a{1});", n + argstart, n + 1);
+                }
+                else if (isparams)
+                {
+                    if (t.GetElementType().IsValueType && !IsBaseType(t.GetElementType()))
+                        Write(file, "checkValueParams(l,{0},out a{1});", n + argstart, n + 1);
+                    else
+                        Write(file, "checkParams(l,{0},out a{1});", n + argstart, n + 1);
+                }
+                else if (t.IsArray)
+                    Write(file, "checkArray(l,{0},out a{1});", n + argstart, n + 1);
+                else if (IsValueType(t))
+                {
+                    if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Nullable<>))
+                        Write(file, "checkNullable(l,{0},out a{1});", n + argstart, n + 1);
+                    else
+                        Write(file, "checkValueType(l,{0},out a{1});", n + argstart, n + 1);
+                }
+                else
+                    Write(file, "checkType(l,{0},out a{1});", n + argstart, n + 1);
+            }
+        }
+
+        bool IsValueType(Type t)
+        {
             if (t.IsByRef) t = t.GetElementType();
             return t.BaseType == typeof(ValueType) && !IsBaseType(t);
-		}
+        }
 
-		bool IsBaseType(Type t)
-		{
-			return t.IsPrimitive || LuaObject.isImplByLua(t);
-		}
-		
-		string FullName(string str)
-		{
-			if (str == null)
-			{
-				throw new NullReferenceException();
-			}
-			return RemoveRef(str.Replace("+", "."));
-		}
-		
-		string TypeDecl(Type t)
-		{
-			if (t.IsGenericType)
-			{
-				string ret = GenericBaseName(t);
-				
-				string gs = "";
-				gs += "<";
-				Type[] types = t.GetGenericArguments();
-				for (int n = 0; n < types.Length; n++)
-				{
-					gs += TypeDecl(types[n]);
-					if (n < types.Length - 1)
-						gs += ",";
-				}
-				gs += ">";
-				
-				ret = Regex.Replace(ret, @"`\d", gs);
-				
-				return ret;
-			}
-			if (t.IsArray)
-			{
-				return TypeDecl(t.GetElementType()) + "[]";
-			}
-			else
-				return RemoveRef(t.ToString(), false);
-		}
-		
-		string ExportName(Type t)
-		{
-			if (t.IsGenericType)
-			{
-				return string.Format("Lua_{0}_{1}", _Name(GenericBaseName(t)), _Name(GenericName(t)));
-			}
-			else
-			{
-				string name = RemoveRef(t.FullName, true);
-				name = "Lua_" + name;
-				return name.Replace(".", "_");
-			}
-		}
-		
-		string FullName(Type t)
-		{
-			if (t.FullName == null)
-			{
-				Debug.Log(t.Name);
-				return t.Name;
-			}
-			return FullName(t.FullName);
-		}
-		
-		string FuncCall(MethodBase m,int parOffset = 0)
-		{
-			
-			string str = "";
-			ParameterInfo[] pars = m.GetParameters();
-			for (int n = parOffset; n < pars.Length; n++)
-			{
-				ParameterInfo p = pars[n];
-				if (p.ParameterType.IsByRef && p.IsOut)
-					str += string.Format("out a{0}", n + 1);
-				else if (p.ParameterType.IsByRef)
-					str += string.Format("ref a{0}", n + 1);
-				else
-					str += string.Format("a{0}", n + 1);
-				if (n < pars.Length - 1)
-					str += ",";
-			}
-			return str;
-		}
-		
-	}
+        bool IsBaseType(Type t)
+        {
+            return t.IsPrimitive || LuaObject.isImplByLua(t);
+        }
+
+        string FullName(string str)
+        {
+            if (str == null)
+            {
+                throw new NullReferenceException();
+            }
+            return RemoveRef(str.Replace("+", "."));
+        }
+
+        string TypeDecl(Type t)
+        {
+            if (t.IsGenericType)
+            {
+                string ret = GenericBaseName(t);
+
+                string gs = "";
+                gs += "<";
+                Type[] types = t.GetGenericArguments();
+                for (int n = 0; n < types.Length; n++)
+                {
+                    gs += TypeDecl(types[n]);
+                    if (n < types.Length - 1)
+                        gs += ",";
+                }
+                gs += ">";
+
+                ret = Regex.Replace(ret, @"`\d", gs);
+
+                return ret;
+            }
+            if (t.IsArray)
+            {
+                return TypeDecl(t.GetElementType()) + "[]";
+            }
+            else
+                return RemoveRef(t.ToString(), false);
+        }
+
+        string ExportName(Type t)
+        {
+            if (t.IsGenericType)
+            {
+                return string.Format("Lua_{0}_{1}", _Name(GenericBaseName(t)), _Name(GenericName(t)));
+            }
+            else
+            {
+                string name = RemoveRef(t.FullName, true);
+                name = "Lua_" + name;
+                return name.Replace(".", "_");
+            }
+        }
+
+        string FullName(Type t)
+        {
+            if (t.FullName == null)
+            {
+                Debug.Log(t.Name);
+                return t.Name;
+            }
+            return FullName(t.FullName);
+        }
+
+        string FuncCall(MethodBase m, int parOffset = 0)
+        {
+
+            string str = "";
+            ParameterInfo[] pars = m.GetParameters();
+            for (int n = parOffset; n < pars.Length; n++)
+            {
+                ParameterInfo p = pars[n];
+                if (p.ParameterType.IsByRef && p.IsOut)
+                    str += string.Format("out a{0}", n + 1);
+                else if (p.ParameterType.IsByRef)
+                    str += string.Format("ref a{0}", n + 1);
+                else
+                    str += string.Format("a{0}", n + 1);
+                if (n < pars.Length - 1)
+                    str += ",";
+            }
+            return str;
+        }
+
+    }
 }
