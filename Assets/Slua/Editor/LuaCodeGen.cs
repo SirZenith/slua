@@ -692,6 +692,7 @@ namespace SLua
             CodeGenerator cg = new CodeGenerator();
             cg.path = path;
             cg.GenerateBind(list, name, order);
+            cg.GenerateEmmyLuaBind(list, name);
         }
 
     }
@@ -766,7 +767,11 @@ namespace SLua
 
         static string GetLuaTypeNameFor(string typeName)
         {
-            typeName = typeName.Replace("+", ".");
+            if (String.IsNullOrEmpty(typeName)) return null;
+
+            typeName = typeName.Replace('+', '.').Replace('`', '_');
+            typeName = System.Text.RegularExpressions.Regex.Replace(typeName, @"\[\[.*?\]\]", "");
+            typeName = System.Text.RegularExpressions.Regex.Replace(typeName, @"\[\[.*?", "");
             bool isArray = typeName.EndsWith("[]");
             if (isArray) typeName = typeName.TrimEnd('[', ']');
 
@@ -862,75 +867,55 @@ namespace SLua
 
         class LuaNamespace
         {
-
-            public EOL eol = SLuaSetting.Instance.eol;
-            string NewLine
-            {
-                get
-                {
-                    switch (eol)
-                    {
-                        case EOL.Native:
-                            return System.Environment.NewLine;
-                        case EOL.CRLF:
-                            return "\r\n";
-                        case EOL.CR:
-                            return "\r";
-                        case EOL.LF:
-                            return "\n";
-                        default:
-                            return "";
-                    }
-                }
-            }
             string name;
-            string fullName;
+            string spacePath;
+            string fullName {
+                get => String.IsNullOrEmpty(spacePath)
+                    ? name
+                    : $"{spacePath}.{name}";
+            }
             // wheather a Namespace is also a class
             bool isClass;
             Dictionary<string, LuaNamespace> children = new Dictionary<string, LuaNamespace>();
 
-            public LuaNamespace(string name, string fullName, bool isClass = false)
+            public LuaNamespace(string luaName, string namespacePath, bool isClass = false)
             {
-                this.name = name;
-                this.fullName = fullName;
+                this.name = luaName;
+                this.spacePath = namespacePath;
                 this.isClass = isClass;
             }
 
             public void SetAsClass() { isClass = true; }
-            public void AddChild(string fullPath)
+            public void AddChild(string path, bool isLuaName = false)
             {
-                char[] seps = { '.', '+' };
-                string[] parts = fullPath.Split(seps, 2);
-                if (!children.ContainsKey(parts[0]))
+                if (!isLuaName) path = GetLuaTypeNameFor(path);
+
+                char[] seps = {'.'};
+                string[] parts = path.Split(seps, 2);
+                string childName = parts[0];
+
+                if (!children.ContainsKey(childName))
                 {
                     children.Add(
-                        parts[0],
-                        new LuaNamespace(
-                            parts[0],
-                            String.IsNullOrEmpty(fullName) ? parts[0] : $"{fullName}.{parts[0]}",
-                            parts.Length == 1
-                        )
+                        childName,
+                        new LuaNamespace(childName, fullName, parts.Length == 1)
                     );
                 }
                 if (parts.Length == 1)
-                    children[parts[0]].SetAsClass();
+                    children[childName].SetAsClass();
                 else
-                    children[parts[0]].AddChild(parts[1]);
+                    children[childName].AddChild(parts[1], isLuaName: true);
             }
 
             public void Write(StreamWriter w)
             {
+                if (children.Count == 0) return;
+
                 if (!String.IsNullOrEmpty(name))
                 {
-                    if (isClass)
-                    {
-                        w.WriteLine("---@class {0} : {1}", fullName, name);
-                        w.WriteLine("---@class {0}", name);
-                    }
-                    else
-                    {
-                        w.WriteLine("---@class {0} : Namespace", name);
-                    }
+                    w.Write("---@class {0}", name);
+                    if (!isClass) w.Write(" : Namespace");
+                    w.WriteLine();
 
                     foreach (KeyValuePair<string, LuaNamespace> child in children)
                     {
@@ -938,8 +923,8 @@ namespace SLua
                     }
 
                     w.WriteLine("---@type {0}", name);
-                    w.WriteLine("{0} = {0}", GetLuaTypeNameFor(fullName));
-                    w.Write(NewLine);
+                    w.WriteLine("{0} = {0}", fullName);
+                    w.WriteLine();
                 }
                 foreach (KeyValuePair<string, LuaNamespace> child in children)
                 {
@@ -972,7 +957,6 @@ namespace SLua
 
         public void GenerateBind(List<Type> list, string name, int order)
         {
-            LuaNamespace rootNamespace = new LuaNamespace("", "", false);
             HashSet<Type> exported = new HashSet<Type>();
             string f = System.IO.Path.Combine(path, name + ".cs");
             StreamWriter file = new StreamWriter(f, false, Encoding.UTF8);
@@ -987,7 +971,6 @@ namespace SLua
             foreach (Type t in list)
             {
                 WriteBindType(file, t, list, exported);
-                rootNamespace.AddChild(t.FullName);
             }
             Write(file, "};");
             Write(file, "return list;");
@@ -995,6 +978,13 @@ namespace SLua
             Write(file, "}");
             Write(file, "}");
             file.Close();
+        }
+
+        public void GenerateEmmyLuaBind(List<Type> list, string name)
+        {
+            LuaNamespace rootNamespace = new LuaNamespace("", "", false);
+            foreach (Type t in list)
+                rootNamespace.AddChild(t.FullName);
 
             string ef = Path.Combine(emmyLuaPath, name + ".lua");
             using (var emmyFile = new StreamWriter(ef, false, Encoding.UTF8))
@@ -1076,16 +1066,16 @@ namespace SLua
                     propname.Clear();
                     directfunc.Clear();
 
-                    StreamWriter file, emmyFile;
-                    Begin(t, out file, out emmyFile);
-                    WriteHead(t, file, emmyFile);
+                    StreamWriter file = Begin(t);
+                    WriteHead(t, file);
                     WriteConstructor(t, file);
-                    WriteField(t, file, emmyFile);
-                    WriteFunction(t, file, emmyFile, false);
-                    WriteFunction(t, file, emmyFile, true);
+                    WriteField(t, file);
+                    WriteFunction(t, file, false);
+                    WriteFunction(t, file, true);
                     RegFunction(t, file);
-                    RegEmmyType(t, emmyFile);
-                    End(file, emmyFile);
+                    End(file);
+
+                    GenerateEmmyLua(t);
 
                     if (t.BaseType != null && t.BaseType.Name.Contains("UnityEvent`"))
                     {
@@ -1105,6 +1095,23 @@ namespace SLua
                 return true;
             }
             return false;
+        }
+
+        void GenerateEmmyLua(Type t)
+        {
+            if (t == null) return;
+
+            StreamWriter emmyFile = BeginEmmy(t);
+            if (emmyFile == null) return;
+
+            WriteHeadEmmy(t, emmyFile);
+            WriteFieldEmmy(t, emmyFile);
+            WriteFunctionEmmy(t, emmyFile, false);
+            WriteFunctionEmmy(t, emmyFile, true);
+            RegEmmyType(t, emmyFile);
+            EndEmmy(emmyFile);
+
+            GenerateEmmyLua(t.BaseType);
         }
 
         struct ArgMode
@@ -1440,7 +1447,13 @@ namespace SLua
             Write(file, "}");
         }
 
+        private static string MakeValidFileName(string name)
+        {
+            string invalidChars = System.Text.RegularExpressions.Regex.Escape(new string(System.IO.Path.GetInvalidFileNameChars()));
+            string invalidRegStr = string.Format(@"([{0}]*\.+$)|([{0}]+)", invalidChars);
 
+            return System.Text.RegularExpressions.Regex.Replace(name, invalidRegStr, "_");
+        }
         StreamWriter Begin(Type t)
         {
             string clsname = ExportName(t);
@@ -1450,13 +1463,17 @@ namespace SLua
             return file;
         }
 
-        void Begin(Type t, out StreamWriter file, out StreamWriter emmyFile)
+        StreamWriter BeginEmmy(Type t)
         {
-            file = Begin(t);
             string clsname = ExportNameEmmy(t);
-            string ef = emmyLuaPath + clsname + ".lua";
-            emmyFile = new StreamWriter(ef, false, Encoding.UTF8);
+            string ef = emmyLuaPath + MakeValidFileName(clsname) + ".lua";
+            Debug.Log(ef);
+            if (File.Exists(ef)) return null;
+
+            var emmyFile = new StreamWriter(ef, false, Encoding.UTF8);
             emmyFile.NewLine = NewLine;
+
+            return emmyFile;
         }
 
         private void End(StreamWriter file)
@@ -1466,9 +1483,8 @@ namespace SLua
             file.Close();
         }
 
-        private void End(StreamWriter file, StreamWriter emmyFile)
+        private void EndEmmy(StreamWriter emmyFile)
         {
-            End(file);
             emmyFile.Flush();
             emmyFile.Close();
         }
@@ -1489,13 +1505,19 @@ namespace SLua
             Write(file, "public class {0} : LuaObject {{", ExportName(t));
         }
 
-        private void WriteHead(Type t, StreamWriter file, StreamWriter emmyFile)
+        private void WriteHeadEmmy(Type t, StreamWriter emmyFile)
         {
-            WriteHead(t, file);
+            string name = GetLuaTypeNameFor(t.Name);
+            string fullName = t.FullName != null
+                ? GetLuaTypeNameFor(t.FullName)
+                : "";
             if (t.BaseType != null)
-                emmyFile.WriteLine("---@class {0} : {1} {2}", t.Name, t.BaseType.Name, t.FullName);
+            {
+                string baseName = GetLuaTypeNameFor(t.BaseType.Name);
+                emmyFile.WriteLine("---@class {0} : {1} {2}", name, baseName, fullName);
+            }
             else
-                emmyFile.WriteLine("---@class {0} {1}", t.Name, t.FullName);
+                emmyFile.WriteLine("---@class {0} {1}", name, fullName);
         }
 
         // add namespace for extension method
@@ -1561,10 +1583,8 @@ namespace SLua
             }
         }
 
-        private void WriteFunction(Type t, StreamWriter file, StreamWriter emmyFile, bool writeStatic = false)
+        private void WriteFunctionEmmy(Type t, StreamWriter emmyFile, bool writeStatic = false)
         {
-            WriteFunction(t, file, writeStatic);
-
             BindingFlags bf = BindingFlags.Public | BindingFlags.DeclaredOnly;
             if (writeStatic)
                 bf |= BindingFlags.Static;
@@ -1684,8 +1704,15 @@ namespace SLua
 
         void RegEmmyType(Type t, StreamWriter emmyFile)
         {
-            emmyFile.WriteLine("---@type {0}", GetLuaTypeFor(t));
-            emmyFile.WriteLine("{0} = {0}", GetLuaTypeNameFor(t.FullName));
+            string name = GetLuaTypeFor(t);
+            string fullName = GetLuaTypeNameFor(t.FullName);
+            emmyFile.WriteLine("---@type {0}", name);
+            emmyFile.WriteLine("{0} = {0}", name);
+            if (fullName != name)
+            {
+                emmyFile.WriteLine();
+                emmyFile.WriteLine("---@class {0} : {1}", fullName, name);
+            }
         }
 
         void RegFunction(Type t, StreamWriter file)
@@ -1969,9 +1996,8 @@ namespace SLua
             //for this[]
             WriteItemFunc(t, file, getter, setter);
         }
-        private void WriteField(Type t, StreamWriter file, StreamWriter emmyFile)
+        private void WriteFieldEmmy(Type t, StreamWriter emmyFile)
         {
-            WriteField(t, file);
             FieldInfo[] fields = t.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
             foreach (FieldInfo fi in fields)
             {
