@@ -189,6 +189,7 @@ namespace SLua
                 "UnityEngine.LightProbeGroup",
                 "UnityEngine.Playables",
                 "UnityEngine.Rendering",
+                "Unity.Profiling.LowLevel",
             };
         }
     }
