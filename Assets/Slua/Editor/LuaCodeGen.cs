@@ -1046,6 +1046,15 @@ namespace SLua
                     WriteHead(t, file);
                     RegEnumFunction(t, file);
                     End(file);
+
+                    StreamWriter emmyFile = BeginEmmy(t);
+                    if (emmyFile != null)
+                    {
+                        WriteHeadEmmy(t, emmyFile);
+                        AddEnumEmmy(t, emmyFile);
+                        RegEmmyType(t, emmyFile);
+                        EndEmmy(emmyFile);
+                    }
                 }
                 else if (t.BaseType == typeof(System.MulticastDelegate))
                 {
@@ -1447,6 +1456,16 @@ namespace SLua
             Write(file, "}");
         }
 
+        void AddEnumEmmy(Type t, StreamWriter emmyFile)
+        {
+            string name = GetLuaTypeFor(t);
+            foreach (string variant in Enum.GetNames(t))
+            {
+                emmyFile.WriteLine("---@field {0} {1}", variant, name);
+            }
+
+        }
+
         private static string MakeValidFileName(string name)
         {
             string invalidChars = System.Text.RegularExpressions.Regex.Escape(new string(System.IO.Path.GetInvalidFileNameChars()));
@@ -1706,8 +1725,10 @@ namespace SLua
         {
             string name = GetLuaTypeFor(t);
             string fullName = GetLuaTypeNameFor(t.FullName);
+            emmyFile.WriteLine("{0} = {{}}", name);
             if (fullName != name)
             {
+                emmyFile.WriteLine();
                 emmyFile.WriteLine("---@class {0} : {1}", fullName, name);
             }
         }
