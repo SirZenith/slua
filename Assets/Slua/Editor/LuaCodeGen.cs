@@ -65,7 +65,7 @@ namespace SLua
             {
                 EditorApplication.update += Update;
                 // use this delegation to ensure dispose luavm at last
-                EditorApplication.playmodeStateChanged += () =>
+                EditorApplication.playModeStateChanged += (_) =>
                 {
 
                     if (isPlaying == true && EditorApplication.isPlaying == false)
@@ -761,7 +761,7 @@ namespace SLua
             {typeof(ushort).Name, "integer"},
             {typeof(char).Name, "string"},
             {typeof(string).Name, "string"},
-            {typeof(object).Name, "any"},
+            // {typeof(object).Name, "any"},
             {typeof(void).Name, "nil"}
         };
 
@@ -1706,11 +1706,8 @@ namespace SLua
         {
             string name = GetLuaTypeFor(t);
             string fullName = GetLuaTypeNameFor(t.FullName);
-            emmyFile.WriteLine("---@type {0}", name);
-            emmyFile.WriteLine("{0} = {0}", name);
             if (fullName != name)
             {
-                emmyFile.WriteLine();
                 emmyFile.WriteLine("---@class {0} : {1}", fullName, name);
             }
         }
@@ -2852,7 +2849,15 @@ namespace SLua
 
         private void CheckArgument(StreamWriter file, Type t, int n, int argstart, bool isout, bool isparams)
         {
-            Write(file, "{0} a{1};", TypeDecl(t), n + 1);
+            string decl = TypeDecl(t);
+            if (decl.StartsWith("Unity.Collections."))
+            {
+                Write(file, "var a{1} = new {0}();", decl, n + 1);
+            }
+            else
+            {
+                Write(file, "{0} a{1};", decl, n + 1);
+            }
 
             if (!isout)
             {
